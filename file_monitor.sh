@@ -123,8 +123,9 @@ read_config() {
     SYSTEM_PARAMS_FILE="${SYSTEM_PARAMS_FILE:-$DEFAULT_SYSTEM_PARAMS_FILE}"
     SYSCTL_CONF="${SYSCTL_CONF:-$DEFAULT_SYSCTL_CONF}"
     WHITELIST_FILE="${WHITELIST_FILE:-$DEFAULT_WHITELIST_FILE}"
-    NEW_ITEMS_FILE="${NEW_ITEMS_FILE:-$DEFAULT_NEW_ITEMS_FILE}"
+    NEW_ITEMS_FILE="${NEW_ITEMS_FILE:-$DEFAULT_NEW_ITEMS_FILE}"  # 添加这行
 }
+
 
 # 检查root权限
 check_root() {
@@ -143,7 +144,7 @@ initialize_system() {
         fi
         read_config || return 1
         install_dependencies || return 1
-        setup_sysctl_params || return 1
+        # 移除这里的 setup_sysctl_params 调用
         initialize_whitelist || return 1
         HOSTNAME=$(get_hostname)
         touch "$INIT_FLAG_FILE" > /dev/null 2>&1 || return 1
@@ -487,6 +488,13 @@ remove_from_whitelist() {
 # 监控变化
 monitor_changes() {
     log "INFO" "${BLUE}开始持续监控文件系统变化...${NC}"
+
+    # 确保 NEW_ITEMS_FILE 存在
+    touch "$NEW_ITEMS_FILE" || {
+        log "ERROR" "无法创建或访问新增项目文件：$NEW_ITEMS_FILE"
+        return 1
+    }
+
     (
         inotifywait -m -r -e create,moved_to,delete,moved_from / 2>&1 | while read -r path action file; do
             full_path="${path}${file}"
@@ -502,7 +510,7 @@ monitor_changes() {
                     ;;
                 DELETE|MOVED_FROM)
                     # 从新增项目文件中删除已经不存在的项目
-                    if grep -q "$full_path" "$NEW_ITEMS_FILE"; then
+                    if [ -f "$NEW_ITEMS_FILE" ] && grep -q "$full_path" "$NEW_ITEMS_FILE"; then
                         sed -i "\|$full_path|d" "$NEW_ITEMS_FILE"
                         log "INFO" "检测到删除，已从监控列表移除: $full_path"
                     fi
@@ -515,6 +523,7 @@ monitor_changes() {
     log "INFO" "${GREEN}守护进程已启动，PID: $MONITOR_PID${NC}"
     return 0
 }
+
 
 # 监控包安装
 monitor_package_installation() {
@@ -591,9 +600,10 @@ clean_new_items() {
         return 1
     fi
 
-    if [ -z "$NEW_ITEMS_FILE" ] || [ ! -f "$NEW_ITEMS_FILE" ]; then
-        echo -e "${RED}错误: 新增项目文件不存在或未设置${NC}"
-        return 1
+    if [ ! -f "$NEW_ITEMS_FILE" ]; then
+        log "WARN" "新增项目文件不存在：$NEW_ITEMS_FILE"
+        echo -e "${YELLOW}警告：新增项目文件不存在。没有需要清理的项目。${NC}"
+        return 0
     fi
 
     echo -e "${BLUE}开始智能清理新增项目...${NC}"
@@ -1049,35 +1059,62 @@ restore_system_params() {
         log "ERROR" "${RED}错误：系统参数文件不存在。${NC}"
         return 1
     fi
-    log "INFO" "${BLUE}正在恢复系统参数和更新 99-sysctl.conf 配置...${NC}"
+    log "INFO" "${BLUE}正在检查系统参数和 99-sysctl.conf 配置...${NC}"
 
-    # 创建新的 99-sysctl.conf
-    echo "# 系统参数配置 - $(date)" > "$SYSCTL_CONF"
-    cat "$SYSTEM_PARAMS_FILE" >> "$SYSCTL_CONF"
-    log "INFO" "${GREEN}已创建新的 99-sysctl.conf 文件${NC}"
+    # 创建临时文件
+    local temp_file=$(mktemp)
+    echo "# 系统参数配置" > "$temp_file"
 
-    # 应用 sysctl 更改
-    log "INFO" "${BLUE}正在应用 sysctl 更改...${NC}"
-    local error_count=0
-    local total_count=0
+    # 检查并添加系统参数
+    local changes_detected=false
     while IFS= read -r line; do
-        total_count=$((total_count + 1))
         param=$(echo "$line" | cut -d = -f1 | tr -d ' ')
-        value=$(echo "$line" | cut -d = -f2-)
-        if ! sysctl -w "$param=$value" > /dev/null 2>&1; then
-            log "WARN" "${YELLOW}无法设置参数: $param${NC}"
-            error_count=$((error_count + 1))
+        saved_value=$(echo "$line" | cut -d = -f2-)
+        current_value=$(sysctl -n "$param" 2>/dev/null)
+
+        if [ "$current_value" != "$saved_value" ]; then
+            changes_detected=true
+            echo "$param = $saved_value" >> "$temp_file"
+            log "INFO" "${YELLOW}参数 $param 需要更新${NC}"
+        else
+            echo "$param = $current_value" >> "$temp_file"
         fi
     done < "$SYSTEM_PARAMS_FILE"
 
-    if [ $error_count -eq 0 ]; then
-        log "INFO" "${GREEN}所有 sysctl 更改已成功应用${NC}"
+    # 如果检测到变化，询问用户是否更新
+    if [ "$changes_detected" = true ]; then
+        echo -e "${YELLOW}检测到系统参数有变化。是否要更新 99-sysctl.conf 并应用这些更改？ (y/n)${NC}"
+        read -r response
+        if [[ $response =~ ^[Yy]$ ]]; then
+            # 备份当前的 99-sysctl.conf
+            if [ -f "$SYSCTL_CONF" ]; then
+                cp "$SYSCTL_CONF" "${SYSCTL_CONF}.bak"
+                log "INFO" "${GREEN}已备份当前 99-sysctl.conf 到 ${SYSCTL_CONF}.bak${NC}"
+            fi
+
+            # 更新 99-sysctl.conf
+            mv "$temp_file" "$SYSCTL_CONF"
+            log "INFO" "${GREEN}已更新 99-sysctl.conf${NC}"
+
+            # 应用 sysctl 更改
+            log "INFO" "${BLUE}正在应用 sysctl 更改...${NC}"
+            if sysctl -p "$SYSCTL_CONF" > /dev/null 2>&1; then
+                log "INFO" "${GREEN}所有 sysctl 更改已成功应用${NC}"
+            else
+                log "WARN" "${YELLOW}应用 sysctl 更改时出现问题，请检查日志${NC}"
+            fi
+        else
+            log "INFO" "${YELLOW}用户选择不更新 99-sysctl.conf${NC}"
+            rm "$temp_file"
+        fi
     else
-        log "WARN" "${YELLOW}应用 sysctl 更改时出现问题。$error_count 个参数无法设置（共 $total_count 个）${NC}"
+        log "INFO" "${GREEN}系统参数没有变化，无需更新 99-sysctl.conf${NC}"
+        rm "$temp_file"
     fi
 
-    log "INFO" "${GREEN}系统参数恢复和 99-sysctl.conf 更新操作已完成${NC}"
+    log "INFO" "${GREEN}系统参数检查和更新操作已完成${NC}"
 }
+
 
 # 查看最近更改
 view_new_items() {
@@ -1214,7 +1251,6 @@ stop_and_delete_monitoring() {
     fi
 
     log "INFO" "${GREEN}监控已停止，所有相关数据和进程已删除${NC}"
-    echo -e "${YELLOW}监控系统已完全移除。如需重新启用，请重新运行脚本。${NC}"
 
     return 0
 }
