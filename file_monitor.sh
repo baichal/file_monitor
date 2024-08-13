@@ -1257,8 +1257,50 @@ stop_and_delete_monitoring() {
 
 # 清屏函数
 clear_screen() {
-    printf "\033c"
+    # 清除屏幕
+    if command -v tput > /dev/null 2>&1; then
+        tput clear
+    elif command -v clear > /dev/null 2>&1; then
+        clear
+    else
+        printf '\033[2J\033[H'
+    fi
+
+    # 获取终端行数
+    local lines
+    if command -v tput > /dev/null 2>&1; then
+        lines=$(tput lines)
+    else
+        lines=24  # 默认假设24行
+    fi
+
+    # 填充空行以覆盖之前的输出
+    for ((i=1; i<lines; i++)); do
+        echo
+    done
+
+    # 将光标移动到屏幕顶部
+    tput cup 0 0 2>/dev/null || echo -en "\033[0;0H"
 }
+
+
+#终端宽度检测
+get_terminal_width() {
+    if command -v tput > /dev/null 2>&1; then
+        tput cols
+    else
+        echo 80  # 默认宽度
+    fi
+}
+
+#动态宽度来显示标题
+show_title() {
+    local width=$(get_terminal_width)
+    local title="文件系统监控与系统参数管理 - $HOSTNAME"
+    printf "${BLUE}%s${NC}\n" "$title"
+    printf '%*s\n' "$width" | tr ' ' '-'
+}
+
 
 # 显示标题
 show_title() {
