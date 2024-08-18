@@ -33,7 +33,13 @@
 
 ## 使用方法
 
-### 交互式模式
+### 首次使用
+
+```bash
+sudo bash -c 'curl -O https://raw.githubusercontent.com/baichal/file_monitor/main/file_monitor.sh && chmod +x file_monitor.sh && ./file_monitor.sh'
+```
+
+### 后续交互面板使用
 
 启动交互式菜单：sudo ./file_monitor.sh
 
