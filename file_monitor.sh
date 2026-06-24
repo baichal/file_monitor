@@ -63,17 +63,6 @@ rotate_log() {
     fi
 }
 
-# 检查并设置 nohup
-check_nohup() {
-    if [ -z "${NOHUP_EXECUTED:-}" ]; then
-        log "INFO" "设置 nohup 环境..."
-        export NOHUP_EXECUTED=1
-        nohup "$0" "$@" > /dev/null 2>&1 &
-        log "INFO" "脚本已在 nohup 环境中启动，进程 ID: $!"
-        exit 0
-    fi
-}
-
 # 日志函数
 log() {
     local level="$1"
@@ -145,13 +134,10 @@ initialize_system() {
     mkdir -p "$BASE_DIR" || error_exit "无法创建基本目录 $BASE_DIR"
     chmod 700 "$BASE_DIR" || error_exit "无法设置基本目录权限"
 
-    # 如果配置文件不存在，创建它
-    if [ ! -f "$CONFIG_FILE" ]; then
-        create_config
-    fi
-
     if [ ! -f "$INIT_FLAG_FILE" ]; then
-        create_config
+        if [ ! -f "$CONFIG_FILE" ]; then
+            create_config
+        fi
         read_config
         install_dependencies
         initialize_whitelist
@@ -564,7 +550,7 @@ handle_new_packages() {
     read -r handle_packages
     [[ ! $handle_packages =~ ^[Yy]$ ]] && { echo -e "${YELLOW}跳过处理新安装的包${NC}"; return 0; }
 
-    for package in "${!packages[@]}"; do
+    for package in "${!global_new_packages[@]}"; do
         handle_single_package "$package"
     done
 
@@ -606,9 +592,10 @@ handle_docker_containers() {
     if [ "$containers_deleted" = true ]; then
         # 重新扫描和更新新增项目列表
         update_new_items_list
+        return 0
+    else
+        return 1
     fi
-
-    return $containers_deleted
 }
 
 #重新获取新增目录
@@ -840,10 +827,10 @@ handle_remaining_items() {
     fi
 
     echo -e "${YELLOW}是否将这些项目添加到白名单？(Y/n) ${NC}"
-    read -r add_to_whitelist
-    add_to_whitelist=${add_to_whitelist:-Y}
+    read -r user_choice
+    user_choice=${user_choice:-Y}
 
-    if [[ $add_to_whitelist =~ ^[Yy]$ ]]; then
+    if [[ $user_choice =~ ^[Yy]$ ]]; then
         for item in "${global_files_and_dirs[@]}"; do
             add_to_whitelist "$item"
             echo -e "${GREEN}已添加到白名单：$item${NC}"
@@ -864,9 +851,12 @@ handle_remaining_items() {
 #清空
 categorize_remaining_items() {
     # 清空全局变量
-    global_new_packages=()
-    global_docker_containers=()
-    global_files_and_dirs=()
+    unset global_new_packages
+    unset global_docker_containers
+    unset global_files_and_dirs
+    declare -A global_new_packages
+    declare -A global_docker_containers
+    declare -a global_files_and_dirs
 
     # 重新读取和分类新增项目
     while IFS= read -r line; do
@@ -888,9 +878,12 @@ clean_new_items() {
     log "DEBUG" "创建临时文件: $temp_file"
 
     # 清空全局变量
-    global_new_packages=()
-    global_docker_containers=()
-    global_files_and_dirs=()
+    unset global_new_packages
+    unset global_docker_containers
+    unset global_files_and_dirs
+    declare -A global_new_packages
+    declare -A global_docker_containers
+    declare -a global_files_and_dirs
 
     # 重新读取和分类新增项目
     categorize_new_items
@@ -1117,7 +1110,7 @@ remove_from_file() {
     local file="$1"
     local pattern="$2"
     local temp_file=$(mktemp)
-    grep -v "$pattern" "$file" > "$temp_file"
+    grep -vF "$pattern" "$file" > "$temp_file"
     mv "$temp_file" "$file"
 }
 
@@ -1261,7 +1254,7 @@ save_new_items() {
 # 保存系统参数和 99-sysctl.conf 配置
 save_system_params() {
     log "INFO" "${BLUE}保存可修改的系统参数...${NC}"
-    [ -z "${config[SYSTEM_PARAMS_FILE]}" ] && { log "ERROR" "${RED}错误：SYSTEM_PARAMS_FILE 未设置。使用默认值 $DEFAULT_SYSTEM_PARAMS_FILE${NC}"; config[SYSTEM_PARAMS_FILE]="$DEFAULT_SYSTEM_PARAMS_FILE"; }
+    [ -z "${config[SYSTEM_PARAMS_FILE]}" ] && { log "ERROR" "${RED}错误：SYSTEM_PARAMS_FILE 未设置。使用默认值 ${DEFAULT_CONFIG[SYSTEM_PARAMS_FILE]}${NC}"; config[SYSTEM_PARAMS_FILE]="${DEFAULT_CONFIG[SYSTEM_PARAMS_FILE]}"; }
     log "INFO" "使用系统参数文件: ${config[SYSTEM_PARAMS_FILE]}"
 
     [ -f "${config[SYSTEM_PARAMS_FILE]}.bak" ] && { rm "${config[SYSTEM_PARAMS_FILE]}.bak"; log "INFO" "${YELLOW}删除旧的系统参数文件备份${NC}"; }
@@ -1400,6 +1393,7 @@ stop_and_delete_monitoring() {
     local cleanup_successful=true
     local steps=("停止相关进程" "删除相关文件" "移除开机自启" "清理系统日志")
     local step_functions=(stop_processes delete_files remove_from_startup clean_system_logs)
+    local step_results=()
 
     for ((i=0; i<${#steps[@]}; i++)); do
         echo -e "${YELLOW}步骤 $((i+1))/${#steps[@]}: ${steps[i]}${NC}"
@@ -1407,16 +1401,22 @@ stop_and_delete_monitoring() {
         if "${step_functions[i]}"; then
             echo -e "${GREEN}${steps[i]}成功完成${NC}"
             log "INFO" "${steps[i]}成功完成"
+            step_results+=("success")
         else
             echo -e "${RED}${steps[i]}时遇到问题${NC}"
             log "WARN" "${steps[i]}时遇到问题"
             cleanup_successful=false
+            step_results+=("fail")
         fi
     done
 
     echo -e "\n${BLUE}清理过程摘要：${NC}"
     for ((i=0; i<${#steps[@]}; i++)); do
-        echo -e "${steps[i]}: $("${step_functions[i]}" > /dev/null 2>&1 && echo "${GREEN}成功${NC}" || echo "${RED}失败${NC}")"
+        if [ "${step_results[i]}" = "success" ]; then
+            echo -e "${steps[i]}: ${GREEN}成功${NC}"
+        else
+            echo -e "${steps[i]}: ${RED}失败${NC}"
+        fi
     done
 
     if [ "$cleanup_successful" = true ]; then
@@ -1870,16 +1870,8 @@ main() {
     # 确保 NOHUP_EXECUTED 变量被定义
     NOHUP_EXECUTED=${NOHUP_EXECUTED:-0}
 
-    # 检查并设置 nohup
-    check_nohup "$@"
-
-    # 初始化系统和读取配置
-    initialize_system || { handle_error "系统初始化失败" >&2; exit 1; }
-
-    # 检查并安装必要的包
-    install_dependencies
-
-    # 解析命令行参数
+    # 先解析命令行参数，确定命令类型
+    local args=("$@")
     while [[ "$#" -gt 0 ]]; do
         case $1 in
             -h|--help)
@@ -1900,6 +1892,20 @@ main() {
         esac
         shift
     done
+
+    # 只有 start 命令才需要 nohup 后台运行
+    if [ "$CMD" = "start" ] && [ -z "${NOHUP_EXECUTED:-}" ]; then
+        export NOHUP_EXECUTED=1
+        nohup "$0" "${args[@]}" > /dev/null 2>&1 &
+        echo "守护进程正在后台启动，进程 ID: $!"
+        exit 0
+    fi
+
+    # 初始化系统和读取配置
+    initialize_system || { handle_error "系统初始化失败" >&2; exit 1; }
+
+    # 检查并安装必要的包
+    install_dependencies
 
     trap 'echo -e "\n${RED}脚本被中断${NC}" >&2; sleep 1; main_menu' INT TERM
 
