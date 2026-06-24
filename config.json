@@ -1,0 +1,22 @@
+{
+  "base_dir": "/var/lib/file_monitor",
+  "log_file": "/var/lib/file_monitor/monitor.log",
+  "events_file": "/var/lib/file_monitor/events.jsonl",
+  "packages_file": "/var/lib/file_monitor/packages.json",
+  "whitelist_file": "/var/lib/file_monitor/whitelist.json",
+  "ignore_patterns": [
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+    "/tmp",
+    "/var/log",
+    "/var/cache",
+    "/var/lib/file_monitor"
+  ],
+  "monitor_user_dirs": true,
+  "alert_on_sensitive_changes": true,
+  "max_events": 100000,
+  "log_rotation_size": 10485760,
+  "retention_days": 30
+}
